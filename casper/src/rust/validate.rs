@@ -527,18 +527,29 @@ impl Validate {
         // `block_creator` gates on, so proposer and validator never disagree.
         let earliest_block_number = block.body.state.block_number - expiration_threshold as i64;
         let canonical_won = match crate::rust::util::rholang::interpreter_util::canonical_won_sigs(
+            &s.dag,
             block_store,
             &block.header.parents_hash_list,
+            &s.last_finalized_block,
             earliest_block_number,
         ) {
             Ok(set) => set,
             Err(e) => return Either::Left(BlockError::BlockException(e)),
         };
+        let merge_rejected_sigs: HashSet<Bytes> = block
+            .body
+            .rejected_deploys
+            .iter()
+            .map(|rd| rd.sig.clone())
+            .collect();
         let deploy_key_set: HashSet<Vec<u8>> = block
             .body
             .deploys
             .iter()
-            .filter(|pd| canonical_won.contains(&pd.deploy.sig))
+            .filter(|pd| {
+                canonical_won.contains(&pd.deploy.sig)
+                    && !merge_rejected_sigs.contains(&pd.deploy.sig)
+            })
             .map(|pd| pd.deploy.sig.to_vec())
             .collect();
         if deploy_key_set.is_empty() {

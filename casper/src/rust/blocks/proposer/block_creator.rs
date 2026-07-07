@@ -15,6 +15,7 @@ use block_storage::rust::deploy::key_value_deploy_storage::KeyValueDeployStorage
 use block_storage::rust::deploy::key_value_rejected_deploy_buffer::KeyValueRejectedDeployBuffer;
 use block_storage::rust::key_value_block_store::KeyValueBlockStore;
 use crypto::rust::private_key::PrivateKey;
+use crypto::rust::public_key::PublicKey;
 use crypto::rust::signatures::signed::Signed;
 use models::rust::block_hash::BlockHash;
 use models::rust::casper::pretty_printer;
@@ -22,7 +23,6 @@ use models::rust::casper::protocol::casper_message::{
     BlockMessage, Body, Bond, DeployData, F1r3flyState, Header, Justification, ProcessedDeploy,
     ProcessedSystemDeploy, RejectedDeploy,
 };
-use crypto::rust::public_key::PublicKey;
 use models::rust::validator::Validator;
 use prost::bytes::Bytes;
 use rholang::rust::interpreter::system_processes::BlockData;
@@ -54,6 +54,7 @@ use crate::rust::validator_identity::ValidatorIdentity;
  */
 pub struct PreparedUserDeploys {
     pub deploys: HashSet<Signed<DeployData>>,
+    pub canonical_won_sigs: HashSet<Bytes>,
     pub effective_cap: usize,
     pub cap_hit: bool,
 }
@@ -82,6 +83,7 @@ pub async fn prepare_user_deploys(
         Mutex<block_storage::rust::deploy::key_value_rejected_deploy_buffer::KeyValueRejectedDeployBuffer>,
     >,
     block_store: &KeyValueBlockStore,
+    merge_rejected_sigs: &HashSet<Bytes>,
 ) -> Result<PreparedUserDeploys, CasperError> {
     // Phase 9 (A-3): parking_lot::Mutex — no poison.
     let mut deploy_storage_guard = deploy_storage.lock();
@@ -156,22 +158,29 @@ pub async fn prepare_user_deploys(
 
     let valid_count = valid.len();
 
-    // Record-driven recovery. A deploy is re-includable unless its LATEST canonical
-    // disposition across the FULL merge scope (closure of ALL parents, via
-    // `canonical_won_sigs`) is a WIN — its effect is then already in the merge base
-    // this block builds on, so re-proposing it would double-execute. A keep-one loser
-    // (latest disposition = rejection) or a never-seen deploy is eligible. Walking all
-    // parents (not just the main-parent chain) catches a deploy already won on a
-    // co-parent. `validate.rs::repeat_deploy` applies the SAME canonical-won record,
-    // so proposer and validator never disagree (no recovery block is flagged
-    // InvalidRepeatDeploy).
+    // Record-driven recovery. A deploy is re-includable unless its latest
+    // canonical disposition across the selected parents' main chains is a WIN.
+    // Its effect is then already in the merge base this block builds on, so
+    // re-proposing it would double-execute. A keep-one loser, a side-branch-only
+    // inclusion, or a never-seen deploy is eligible. `validate.rs::repeat_deploy`
+    // applies the same canonical-won record, so proposer and validator do not
+    // disagree on recovery blocks.
     let parent_hashes: Vec<BlockHash> = casper_snapshot
         .parents
         .iter()
         .map(|p| p.block_hash.clone())
         .collect();
-    let canonical_won =
-        interpreter_util::canonical_won_sigs(block_store, &parent_hashes, earliest_block_number)?;
+    let canonical_won = interpreter_util::canonical_won_sigs(
+        &casper_snapshot.dag,
+        block_store,
+        &parent_hashes,
+        &casper_snapshot.last_finalized_block,
+        earliest_block_number,
+    )?;
+    let canonical_won: HashSet<Bytes> = canonical_won
+        .difference(merge_rejected_sigs)
+        .cloned()
+        .collect();
 
     let already_in_scope: Vec<Signed<DeployData>> = valid
         .iter()
@@ -340,6 +349,7 @@ pub async fn prepare_user_deploys(
         }
         return Ok(PreparedUserDeploys {
             deploys: valid_unique,
+            canonical_won_sigs: canonical_won,
             effective_cap: max_user_deploys,
             cap_hit: false,
         });
@@ -365,8 +375,8 @@ pub async fn prepare_user_deploys(
         if DEPLOY_SELECTION_RESERVE_TAIL_ENABLED {
             if max_user_deploys == 1 {
                 (
-                    ordered.iter().last().cloned().into_iter().collect(),
-                    "newest-only",
+                    ordered.iter().next().cloned().into_iter().collect(),
+                    "oldest-only",
                 )
             } else {
                 let oldest_take = max_user_deploys.saturating_sub(1);
@@ -418,9 +428,22 @@ pub async fn prepare_user_deploys(
 
     Ok(PreparedUserDeploys {
         deploys: selected,
+        canonical_won_sigs: canonical_won,
         effective_cap: max_user_deploys,
         cap_hit: true,
     })
+}
+
+fn retain_reproposable_self_chain_deploys(
+    deploys: &mut HashSet<Signed<DeployData>>,
+    self_chain_deploy_sigs: &HashSet<Bytes>,
+    canonical_won_sigs: &HashSet<Bytes>,
+) -> usize {
+    let before = deploys.len();
+    deploys.retain(|deploy| {
+        !self_chain_deploy_sigs.contains(&deploy.sig) || !canonical_won_sigs.contains(&deploy.sig)
+    });
+    before.saturating_sub(deploys.len())
 }
 
 fn collect_self_chain_deploy_sigs(
@@ -772,6 +795,32 @@ pub async fn create(
 
     let shard_id = casper_snapshot.on_chain_state.shard_conf.shard_name.clone();
 
+    // Merge the parents before user-deploy selection so selection can distinguish
+    // deploys whose parent branch is present from deploys whose parent branch was
+    // rejected by the merge and must be re-proposed against the merged base.
+    let __merge_pre_t = std::time::Instant::now();
+    let latest_messages: BTreeMap<Validator, BlockHash> = casper_snapshot
+        .justifications
+        .iter()
+        .map(|j| (j.validator.clone(), j.latest_block_hash.clone()))
+        .collect();
+    let merge_pre_info = interpreter_util::compute_parents_post_state(
+        block_store,
+        parents.clone(),
+        casper_snapshot,
+        runtime_manager,
+        &latest_messages,
+        None,
+        Some(&rejected_deploy_buffer),
+    )
+    .await?;
+    metrics::histogram!(
+        BLOCK_CREATOR_COMPUTE_PARENTS_POST_STATE_TIME_METRIC,
+        "source" => CASPER_METRICS_SOURCE
+    )
+    .record(__merge_pre_t.elapsed().as_secs_f64());
+    let merge_rejected_user_sigs: HashSet<Bytes> = merge_pre_info.1.iter().cloned().collect();
+
     // Prepare deploys
     let (user_deploys, _, _) = {
         let t = std::time::Instant::now();
@@ -782,24 +831,21 @@ pub async fn create(
             deploy_storage.clone(),
             rejected_deploy_buffer.clone(),
             block_store,
+            &merge_rejected_user_sigs,
         )
         .await?;
         let mut v = prepared.deploys;
         let self_chain_deploy_sigs =
             collect_self_chain_deploy_sigs(casper_snapshot, validator_identity, block_store)?;
         if !self_chain_deploy_sigs.is_empty() {
-            let before = v.len();
             // A sig in the proposer's self-chain is normally a duplicate and
-            // must be filtered out. The exception is a sig in
-            // `rejected_in_scope`: the merge engine conflict-rejected it, so
-            // its effects never landed in canonical state and re-proposing
-            // it is correct. Mirror the same exemption that
-            // `prepare_user_deploys` applies upstream.
-            v.retain(|deploy| {
-                !self_chain_deploy_sigs.contains(&deploy.sig)
-                    || casper_snapshot.rejected_in_scope.contains(&deploy.sig)
-            });
-            let skipped = before.saturating_sub(v.len());
+            // must be filtered out. Side-branch-only inclusions remain
+            // re-proposable because their sig is absent from canonical_won_sigs.
+            let skipped = retain_reproposable_self_chain_deploys(
+                &mut v,
+                &self_chain_deploy_sigs,
+                &prepared.canonical_won_sigs,
+            );
             if skipped > 0 {
                 tracing::info!(
                     "Filtered {} deploy(s) already present in self latest-message chain",
@@ -848,8 +894,8 @@ pub async fn create(
     // Add dummy deploys
     all_deploys.extend(dummy_deploys);
 
-    // Merge the parents once up front. Two reasons to do this before the
-    // empty-block skip check below:
+    // The parent merge was computed before user-deploy selection. Two reasons
+    // it must happen before the empty-block skip check below:
     //   1. To discover slashes that were rejected by cost-optimal merge
     //      resolution — those slashes must be re-issued by this proposer
     //      so the slash effect lands in the merge block regardless of the
@@ -858,29 +904,6 @@ pub async fn create(
     //      decision. A heartbeat-disabled proposer that wakes with no user
     //      deploys and no own-detected slashes would otherwise skip,
     //      stranding any merge-rejected slashes from parent merging.
-    // The merge result is cached so the downstream compute_deploys_checkpoint
-    // call hits the cache.
-    let __merge_pre_t = std::time::Instant::now();
-    let latest_messages: BTreeMap<Validator, BlockHash> = casper_snapshot
-        .justifications
-        .iter()
-        .map(|j| (j.validator.clone(), j.latest_block_hash.clone()))
-        .collect();
-    let merge_pre_info = interpreter_util::compute_parents_post_state(
-        block_store,
-        parents.clone(),
-        casper_snapshot,
-        runtime_manager,
-        &latest_messages,
-        None,
-        Some(&rejected_deploy_buffer),
-    )
-    .await?;
-    metrics::histogram!(
-        BLOCK_CREATOR_COMPUTE_PARENTS_POST_STATE_TIME_METRIC,
-        "source" => CASPER_METRICS_SOURCE
-    )
-    .record(__merge_pre_t.elapsed().as_secs_f64());
     let (_pre_state, _rejected_user_sigs, rejected_slashes) = merge_pre_info;
 
     // Union own slashes with merge-rejected slashes, dedup by

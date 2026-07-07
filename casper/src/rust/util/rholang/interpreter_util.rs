@@ -105,20 +105,17 @@ fn compute_rejected_buffer_admits(
     result
 }
 
-/// Sigs whose LATEST canonical disposition across the FULL merge scope is a WIN.
-/// BFS-walks the closure of ALL `parents` (not just the main-parent chain) down to
-/// the deploy-lifespan floor, recording each sig's highest-block disposition: in a
-/// block's `body.deploys` it is a WIN, in `body.rejected_deploys` a REJECTION.
-/// Returns the sigs whose highest-block disposition is a WIN — their effect is in
-/// the merge base the proposing block builds on, so re-proposing them would
-/// double-apply. Walking ALL parents (not only `parents[0]`) catches a deploy
-/// already won on a CO-PARENT of a multi-parent merge, which a main-parent-only
-/// walk misses and re-proposes into a double-apply; a real recovery loser is still
-/// exempt because the merge that rejected it sits at a strictly higher block than
-/// its inclusion. Reads only signed block bodies, so the result is node-identical.
+/// Sigs whose latest main-chain disposition across the selected parents is a WIN.
+///
+/// Walk each parent through its main-parent chain down to the deploy-lifespan
+/// floor. A deploy that only appears in secondary-parent ancestry is not proof
+/// that its effects reached the post-state this block builds on; treating it as
+/// won can strand deploys in finalized side branches forever.
 pub fn canonical_won_sigs(
+    dag: &KeyValueDagRepresentation,
     block_store: &KeyValueBlockStore,
     parents: &[BlockHash],
+    last_finalized_block: &BlockHash,
     earliest_block_number: i64,
 ) -> Result<HashSet<Bytes>, CasperError> {
     // sig -> (highest block_number observed, won at that height?). A win and a
@@ -127,28 +124,40 @@ pub fn canonical_won_sigs(
     // REJECTION so a keep-one loser stays re-proposable.
     let mut disposition: HashMap<Bytes, (i64, bool)> = HashMap::new();
     let mut visited: HashSet<BlockHash> = HashSet::new();
-    let mut queue: VecDeque<BlockHash> = parents.iter().cloned().collect();
-    while let Some(hash) = queue.pop_front() {
-        if !visited.insert(hash.clone()) {
-            continue;
-        }
-        let Some(block) = block_store.get(&hash)? else {
-            continue;
-        };
-        let bn = block.body.state.block_number;
-        if bn < earliest_block_number {
-            continue;
-        }
-        for pd in &block.body.deploys {
-            record_disposition(&mut disposition, pd.deploy.sig.clone(), bn, true);
-        }
-        for rd in &block.body.rejected_deploys {
-            record_disposition(&mut disposition, rd.sig.clone(), bn, false);
-        }
-        for p in &block.header.parents_hash_list {
-            queue.push_back(p.clone());
+
+    for parent in parents {
+        let mut current = parent.clone();
+        loop {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            let Some(block) = block_store.get(&current)? else {
+                break;
+            };
+            let bn = block.body.state.block_number;
+            if bn < earliest_block_number {
+                break;
+            }
+
+            let finalized_side_branch = dag.is_finalized(&current)
+                && &current != last_finalized_block
+                && !dag.is_in_main_chain(&current, last_finalized_block)?;
+            if !finalized_side_branch {
+                for pd in &block.body.deploys {
+                    record_disposition(&mut disposition, pd.deploy.sig.clone(), bn, true);
+                }
+                for rd in &block.body.rejected_deploys {
+                    record_disposition(&mut disposition, rd.sig.clone(), bn, false);
+                }
+            }
+
+            let Some(main_parent) = dag.main_parent(&current) else {
+                break;
+            };
+            current = main_parent;
         }
     }
+
     Ok(disposition
         .into_iter()
         .filter_map(|(sig, (_, won))| won.then_some(sig))

@@ -19,9 +19,10 @@ use block_storage::rust::deploy::key_value_deploy_storage::KeyValueDeployStorage
 use block_storage::rust::deploy::key_value_rejected_deploy_buffer::KeyValueRejectedDeployBuffer;
 use block_storage::rust::key_value_block_store::KeyValueBlockStore;
 use comm::rust::transport::transport_layer::TransportLayer;
+use crypto::rust::signatures::signed::Signed;
 use models::rust::block_hash::BlockHash;
 use models::rust::casper::pretty_printer::PrettyPrinter;
-use models::rust::casper::protocol::casper_message::{BlockMessage, RejectedDeploy};
+use models::rust::casper::protocol::casper_message::{BlockMessage, DeployData, RejectedDeploy};
 // Phase 9 (A-3): deploy_storage uses parking_lot::Mutex.
 use parking_lot::Mutex;
 use shared::rust::shared::f1r3fly_events::F1r3flyEvents;
@@ -58,6 +59,22 @@ pub(crate) fn purge_finalized_deploys_from_buffer(
     for rd in rejected_deploys {
         let _ = buffer.remove_by_sig(&rd.sig);
     }
+}
+
+/// A finalized-but-noncanonical block is final for DAG safety, not final for
+/// deploy effects. Its user deploys must become recovery candidates on every
+/// node that saw the block; otherwise only the original submitter's local
+/// deploy storage can retry them, and the deploy can expire if those retries
+/// keep losing fork choice.
+pub(crate) fn buffer_noncanonical_deploys_for_reproposal(
+    buffer: &mut KeyValueRejectedDeployBuffer,
+    deploys: Vec<Signed<DeployData>>,
+) -> Result<usize, KvStoreError> {
+    let count = deploys.len();
+    if count > 0 {
+        buffer.add(deploys)?;
+    }
+    Ok(count)
 }
 
 // Phase 13 (TC-1): the previous `FINALIZER_BLOCKING_TIMEOUT = 15s`
@@ -217,12 +234,19 @@ pub(crate) async fn compute_last_finalized_block(
                     let runtime_manager = runtime_manager.clone();
                     let event_publisher = event_publisher.clone();
                     let finalization_in_progress = finalization_in_progress.clone();
+                    let block_dag_storage = block_dag_storage.clone();
+                    let new_lfb = new_lfb.clone();
                     Box::pin(async move {
                         let process_finalized_started = std::time::Instant::now();
                         // Use RAII guard to ensure flag is reset even if we return early or panic
                         finalization_in_progress.store(true, Ordering::SeqCst);
                         let _guard = FinalizationGuard(finalization_in_progress.as_ref());
                         tracing::debug!("Finalization started for {} blocks", finalized_set.len());
+
+                        let finalized_set_str = PrettyPrinter::build_string_hashes(
+                            &finalized_set.iter().map(|h| h.to_vec()).collect::<Vec<_>>(),
+                        );
+                        let dag_snapshot = block_dag_storage.get_representation()?;
 
                         // process_finalized
                         for block_hash in &finalized_set {
@@ -242,49 +266,60 @@ pub(crate) async fn compute_last_finalized_block(
                                 .map(|pd| pd.deploy.clone())
                                 .collect();
 
-                            // Remove block deploys from persistent store.
-                            // Phase 9 (A-3): parking_lot::Mutex — no poison.
                             let deploys_count = deploys.len();
-                            let deploy_sigs_for_buffer: Vec<Vec<u8>> =
-                                deploys.iter().map(|d| d.sig.to_vec()).collect();
-                            deploy_storage.lock().remove(deploys)?;
+                            let is_canonical = block_hash == &new_lfb
+                                || dag_snapshot.is_in_main_chain(block_hash, &new_lfb)?;
 
-                            // Purge the rejected-deploy buffer of any sig that
-                            // landed in a finalized block, so recovered deploys
-                            // don't linger after canonical inclusion. Also purge
-                            // any sig listed in `body.rejected_deploys` on this
-                            // finalized block — those are definitively lost and
-                            // must not be re-proposed from this node's buffer.
-                            //
-                            // Restored from the merge-base / sealed-floor: the
-                            // casper_engine split (HEAD) dropped this purge when
-                            // extracting `finalization_runner`. Without it,
-                            // record-driven recovery re-proposes already-finalized
-                            // deploys, double-applying them (e.g. a second write
-                            // to a single-value cell → IntegerAdd invariant
-                            // violation under the convergence green-gate).
-                            {
-                                let mut buffer_guard =
-                                    rejected_deploy_buffer.lock().map_err(|_| {
-                                        KvStoreError::LockError(
-                                            "Failed to acquire rejected_deploy_buffer lock"
-                                                .to_string(),
-                                        )
-                                    })?;
-                                purge_finalized_deploys_from_buffer(
-                                    &mut *buffer_guard,
-                                    &deploy_sigs_for_buffer,
-                                    &block.body.rejected_deploys,
+                            if is_canonical {
+                                // Phase 9 (A-3): parking_lot::Mutex — no poison.
+                                let deploy_sigs_for_buffer: Vec<Vec<u8>> =
+                                    deploys.iter().map(|d| d.sig.to_vec()).collect();
+                                deploy_storage.lock().remove(deploys)?;
+
+                                // Only canonical finalized blocks can make a deploy terminal.
+                                // Side-branch finalization is DAG-finality, not proof that its
+                                // deploy effects reached the canonical tuplespace.
+                                {
+                                    let mut buffer_guard =
+                                        rejected_deploy_buffer.lock().map_err(|_| {
+                                            KvStoreError::LockError(
+                                                "Failed to acquire rejected_deploy_buffer lock"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                    purge_finalized_deploys_from_buffer(
+                                        &mut *buffer_guard,
+                                        &deploy_sigs_for_buffer,
+                                        &block.body.rejected_deploys,
+                                    );
+                                }
+                                tracing::info!(
+                                    "Removed {} deploys from deploy history as we finalized canonical block {} in finalized set {}.",
+                                    deploys_count,
+                                    PrettyPrinter::build_string_bytes(block_hash),
+                                    finalized_set_str
+                                );
+                            } else {
+                                {
+                                    let mut buffer_guard =
+                                        rejected_deploy_buffer.lock().map_err(|_| {
+                                            KvStoreError::LockError(
+                                                "Failed to acquire rejected_deploy_buffer lock"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                    buffer_noncanonical_deploys_for_reproposal(
+                                        &mut *buffer_guard,
+                                        deploys,
+                                    )?;
+                                }
+                                tracing::info!(
+                                    "Buffered {} deploys from finalized noncanonical block {} for re-proposal; finalized set {}.",
+                                    deploys_count,
+                                    PrettyPrinter::build_string_bytes(block_hash),
+                                    finalized_set_str
                                 );
                             }
-                            let finalized_set_str = PrettyPrinter::build_string_hashes(
-                                &finalized_set.iter().map(|h| h.to_vec()).collect::<Vec<_>>(),
-                            );
-                            let removed_deploy_msg = format!(
-                                "Removed {} deploys from deploy history as we finalized block {}.",
-                                deploys_count, finalized_set_str
-                            );
-                            tracing::info!("{}", removed_deploy_msg);
 
                             // Remove block index from cache
                             runtime_manager.remove_block_index_cache(block_hash);
@@ -419,9 +454,10 @@ pub(crate) async fn update_last_finalized_block<T: TransportLayer + Send + Sync>
 
 #[cfg(test)]
 mod tests {
+    use rspace_plus_plus::rspace::shared::in_mem_store_manager::InMemoryStoreManager;
+
     use super::*;
     use crate::rust::util::construct_deploy;
-    use rspace_plus_plus::rspace::shared::in_mem_store_manager::InMemoryStoreManager;
 
     /// DL-1 (deploy-lifecycle finalization purge). Finalizing a block must remove from THIS
     /// node's rejected-deploy buffer BOTH the deploys the block INCLUDED (they landed
@@ -472,6 +508,27 @@ mod tests {
         assert!(
             buffer.contains_sig(&survivor.sig).expect("contains"),
             "an unrelated buffered deploy must survive the finalization purge (still re-proposable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn noncanonical_finalized_deploys_are_buffered_for_reproposal() {
+        let mut kvm = InMemoryStoreManager::new();
+        let mut buffer = KeyValueRejectedDeployBuffer::new(&mut kvm)
+            .await
+            .expect("in-memory rejected-deploy buffer");
+
+        let deploy =
+            construct_deploy::source_deploy("@1!(1)".to_string(), 1, None, None, None, None, None)
+                .expect("deploy");
+
+        let count = buffer_noncanonical_deploys_for_reproposal(&mut buffer, vec![deploy.clone()])
+            .expect("buffer noncanonical deploy");
+
+        assert_eq!(count, 1);
+        assert!(
+            buffer.contains_sig(&deploy.sig).expect("contains"),
+            "a deploy from a finalized noncanonical block must be available for re-proposal"
         );
     }
 }

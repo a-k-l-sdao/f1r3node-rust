@@ -200,31 +200,64 @@ pub(crate) async fn admit_has_pending_deploys_in_storage_for_snapshot<
             ))
         })?;
 
+    let parent_hashes: Vec<BlockHash> = snapshot
+        .parents
+        .iter()
+        .map(|p| p.block_hash.clone())
+        .collect();
+    let canonical_won = interpreter_util::canonical_won_sigs(
+        &snapshot.dag,
+        &this.block_store,
+        &parent_hashes,
+        &snapshot.last_finalized_block,
+        earliest_block_number,
+    )?;
+
+    let is_ready = |deploy: &Signed<DeployData>| {
+        let block_expired = deploy.data.valid_after_block_number <= earliest_block_number;
+        let time_expired = deploy.data.is_expired_at(current_time_millis);
+        if block_expired || time_expired {
+            return false;
+        }
+
+        // `pending_deploy_is_future_for_next_block` is `pub(super)`
+        // in `events`; the call resolves because `block_admission` is
+        // a sibling sub-module of `events` under `engine::multi_parent_casper`.
+        let is_future = super::events::pending_deploy_is_future_for_next_block(
+            latest_block_number,
+            deploy.data.valid_after_block_number,
+        );
+        let already_in_scope = canonical_won.contains(&deploy.sig);
+        !is_future && !already_in_scope
+    };
+
     // Phase 9 (A-3): `deploy_storage` is `parking_lot::Mutex`.
-    let storage = this.deploy_storage.lock();
-    if !storage.non_empty().map_err(|e| {
-        CasperError::RuntimeError(format!("Failed to query deploy storage: {:?}", e))
+    {
+        let storage = this.deploy_storage.lock();
+        if storage.non_empty().map_err(|e| {
+            CasperError::RuntimeError(format!("Failed to query deploy storage: {:?}", e))
+        })? && storage.any(|deploy| Ok(is_ready(deploy))).map_err(|e| {
+            CasperError::RuntimeError(format!("Failed to scan deploy storage: {:?}", e))
+        })? {
+            return Ok(true);
+        }
+    }
+
+    let buffer = this
+        .rejected_deploy_buffer
+        .lock()
+        .map_err(|e| CasperError::LockError(e.to_string()))?;
+    if !buffer.non_empty().map_err(|e| {
+        CasperError::RuntimeError(format!("Failed to query rejected deploy buffer: {:?}", e))
     })? {
         return Ok(false);
     }
 
-    storage
-        .any(|deploy| {
-            let block_expired = deploy.data.valid_after_block_number <= earliest_block_number;
-            let time_expired = deploy.data.is_expired_at(current_time_millis);
-            if block_expired || time_expired {
-                return Ok(false);
-            }
-
-            // `pending_deploy_is_future_for_next_block` is `pub(super)`
-            // in `events`; the call resolves because `block_admission` is
-            // a sibling sub-module of `events` under `engine::multi_parent_casper`.
-            let is_future = super::events::pending_deploy_is_future_for_next_block(
-                latest_block_number,
-                deploy.data.valid_after_block_number,
-            );
-            let already_in_scope = snapshot.deploys_in_scope.contains(&deploy.sig);
-            Ok(!is_future && !already_in_scope)
-        })
-        .map_err(|e| CasperError::RuntimeError(format!("Failed to scan deploy storage: {:?}", e)))
+    Ok(buffer
+        .read_all()
+        .map_err(|e| {
+            CasperError::RuntimeError(format!("Failed to scan rejected deploy buffer: {:?}", e))
+        })?
+        .iter()
+        .any(is_ready))
 }
