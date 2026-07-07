@@ -86,7 +86,7 @@ pub struct RuntimeManager {
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub struct ParentsPostStateCacheKey {
-    pub sorted_parent_hashes: Vec<BlockHash>,
+    pub parent_hashes: Vec<BlockHash>,
     // Snapshot LFB participates in visible-ancestor filtering, so cache key must include it.
     pub snapshot_lfb_hash: BlockHash,
     pub disable_late_block_filtering: bool,

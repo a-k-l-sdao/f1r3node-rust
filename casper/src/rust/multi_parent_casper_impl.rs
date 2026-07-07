@@ -1367,6 +1367,18 @@ impl<T: TransportLayer + Send + Sync> MultiParentCasper for MultiParentCasperImp
             return Ok(false);
         }
 
+        let parent_hashes: Vec<BlockHash> = snapshot
+            .parents
+            .iter()
+            .map(|parent| parent.block_hash.clone())
+            .collect();
+        let canonical_won = interpreter_util::canonical_won_sigs(
+            &snapshot.dag,
+            &self.block_store,
+            &parent_hashes,
+            earliest_block_number,
+        )?;
+
         storage
             .any(|deploy| {
                 let block_expired = deploy.data.valid_after_block_number <= earliest_block_number;
@@ -1382,8 +1394,8 @@ impl<T: TransportLayer + Send + Sync> MultiParentCasper for MultiParentCasperImp
                     latest_block_number,
                     deploy.data.valid_after_block_number,
                 );
-                let already_in_scope = snapshot.deploys_in_scope.contains(&deploy.sig);
-                Ok(!is_future && !already_in_scope)
+                let already_terminal = canonical_won.contains(&deploy.sig);
+                Ok(!is_future && !already_terminal)
             })
             .map_err(|e| {
                 CasperError::RuntimeError(format!("Failed to scan deploy storage: {:?}", e))
@@ -1446,12 +1458,19 @@ async fn compute_last_finalized_block(
                     let runtime_manager = runtime_manager.clone();
                     let event_publisher = event_publisher.clone();
                     let finalization_in_progress = finalization_in_progress.clone();
+                    let block_dag_storage = block_dag_storage.clone();
+                    let new_lfb = new_lfb.clone();
                     Box::pin(async move {
                         let process_finalized_started = std::time::Instant::now();
                         // Use RAII guard to ensure flag is reset even if we return early or panic
                         finalization_in_progress.store(true, Ordering::SeqCst);
                         let _guard = FinalizationGuard(finalization_in_progress.as_ref());
                         tracing::debug!("Finalization started for {} blocks", finalized_set.len());
+
+                        let finalized_set_str = PrettyPrinter::build_string_hashes(
+                            &finalized_set.iter().map(|h| h.to_vec()).collect::<Vec<_>>(),
+                        );
+                        let dag_snapshot = block_dag_storage.get_representation();
 
                         // process_finalized
                         for block_hash in &finalized_set {
@@ -1462,50 +1481,55 @@ async fn compute_last_finalized_block(
                                 .iter()
                                 .map(|pd| pd.deploy.clone())
                                 .collect();
-
-                            // Remove block deploys from persistent store
                             let deploys_count = deploys.len();
-                            let deploy_sigs_for_buffer: Vec<Vec<u8>> =
-                                deploys.iter().map(|d| d.sig.to_vec()).collect();
-                            deploy_storage
-                                .lock()
-                                .map_err(|_| {
-                                    KvStoreError::LockError(
-                                        "Failed to acquire deploy_storage lock".to_string(),
-                                    )
-                                })?
-                                .remove(deploys)?;
+                            let is_canonical = block_hash == &new_lfb
+                                || dag_snapshot.is_in_main_chain(block_hash, &new_lfb)?;
 
-                            // Purge the rejected-deploy buffer of any sig that
-                            // landed in a finalized block, so recovered deploys
-                            // don't linger after canonical inclusion. Also purge
-                            // any sig listed in body.rejected_deploys on this
-                            // finalized block — those are definitively lost and
-                            // should not be re-proposed from this node's buffer.
-                            {
-                                let mut buffer_guard =
-                                    rejected_deploy_buffer.lock().map_err(|_| {
+                            if is_canonical {
+                                let deploy_sigs_for_buffer: Vec<Vec<u8>> =
+                                    deploys.iter().map(|d| d.sig.to_vec()).collect();
+                                deploy_storage
+                                    .lock()
+                                    .map_err(|_| {
                                         KvStoreError::LockError(
-                                            "Failed to acquire rejected_deploy_buffer lock"
-                                                .to_string(),
+                                            "Failed to acquire deploy_storage lock".to_string(),
                                         )
-                                    })?;
-                                for sig in &deploy_sigs_for_buffer {
-                                    let _ = buffer_guard.remove_by_sig(sig);
-                                }
-                                for rd in &block.body.rejected_deploys {
-                                    let _ = buffer_guard.remove_by_sig(&rd.sig);
-                                }
-                            }
+                                    })?
+                                    .remove(deploys)?;
 
-                            let finalized_set_str = PrettyPrinter::build_string_hashes(
-                                &finalized_set.iter().map(|h| h.to_vec()).collect::<Vec<_>>(),
-                            );
-                            let removed_deploy_msg = format!(
-                                "Removed {} deploys from deploy history as we finalized block {}.",
-                                deploys_count, finalized_set_str
-                            );
-                            tracing::info!("{}", removed_deploy_msg);
+                                // Only canonical finalized blocks can make a deploy terminal.
+                                // Side-branch finalization is DAG-finality, not proof that its
+                                // deploy effects reached the canonical tuplespace.
+                                {
+                                    let mut buffer_guard =
+                                        rejected_deploy_buffer.lock().map_err(|_| {
+                                            KvStoreError::LockError(
+                                                "Failed to acquire rejected_deploy_buffer lock"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                    for sig in &deploy_sigs_for_buffer {
+                                        let _ = buffer_guard.remove_by_sig(sig);
+                                    }
+                                    for rd in &block.body.rejected_deploys {
+                                        let _ = buffer_guard.remove_by_sig(&rd.sig);
+                                    }
+                                }
+
+                                tracing::info!(
+                                    "Removed {} deploys from deploy history as we finalized canonical block {} in finalized set {}.",
+                                    deploys_count,
+                                    PrettyPrinter::build_string_bytes(block_hash),
+                                    finalized_set_str
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Keeping {} deploys from finalized noncanonical block {} in deploy history for possible re-proposal; finalized set {}.",
+                                    deploys_count,
+                                    PrettyPrinter::build_string_bytes(block_hash),
+                                    finalized_set_str
+                                );
+                            }
 
                             // Remove block index from cache
                             runtime_manager.remove_block_index_cache(block_hash);

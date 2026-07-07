@@ -45,6 +45,7 @@ use crate::rust::validator_identity::ValidatorIdentity;
  */
 pub struct PreparedUserDeploys {
     pub deploys: HashSet<Signed<DeployData>>,
+    pub canonical_won_sigs: HashSet<Bytes>,
     pub effective_cap: usize,
     pub cap_hit: bool,
 }
@@ -135,22 +136,24 @@ pub async fn prepare_user_deploys(
 
     let valid_count = valid.len();
 
-    // Record-driven recovery. A deploy is re-includable unless its LATEST canonical
-    // disposition across the FULL merge scope (closure of ALL parents, via
-    // `canonical_won_sigs`) is a WIN — its effect is then already in the merge base
-    // this block builds on, so re-proposing it would double-execute. A keep-one loser
-    // (latest disposition = rejection) or a never-seen deploy is eligible. Walking all
-    // parents (not just the main-parent chain) catches a deploy already won on a
-    // co-parent. `validate.rs::repeat_deploy` applies the SAME canonical-won record,
-    // so proposer and validator never disagree (no recovery block is flagged
-    // InvalidRepeatDeploy).
+    // Record-driven recovery. A deploy is re-includable unless its latest
+    // canonical disposition across the selected parents' main chains is a WIN.
+    // Its effect is then already in the merge base this block builds on, so
+    // re-proposing it would double-execute. A keep-one loser, a side-branch-only
+    // inclusion, or a never-seen deploy is eligible. `validate.rs::repeat_deploy`
+    // applies the same canonical-won record, so proposer and validator do not
+    // disagree on recovery blocks.
     let parent_hashes: Vec<BlockHash> = casper_snapshot
         .parents
         .iter()
         .map(|p| p.block_hash.clone())
         .collect();
-    let canonical_won =
-        interpreter_util::canonical_won_sigs(block_store, &parent_hashes, earliest_block_number)?;
+    let canonical_won = interpreter_util::canonical_won_sigs(
+        &casper_snapshot.dag,
+        block_store,
+        &parent_hashes,
+        earliest_block_number,
+    )?;
 
     let already_in_scope: Vec<Signed<DeployData>> = valid
         .iter()
@@ -201,7 +204,7 @@ pub async fn prepare_user_deploys(
                 step = "prepare_user_deploys.FILTER",
                 deploy = %hex::encode(&d.sig[..8.min(d.sig.len())]),
                 decision = "filtered",
-                reason = "already-in-scope (repeat_deploy / deploys_in_scope, non-stale)",
+                reason = "canonical-won (repeat_deploy-visible, non-stale)",
                 "merge.step: deploy filter decision"
             );
         }
@@ -264,7 +267,7 @@ pub async fn prepare_user_deploys(
     }
     for d in &already_in_scope {
         tracing::warn!(
-            "Deploy {}... FILTERED (already in scope): deploy already exists in DAG within lifespan window",
+            "Deploy {}... FILTERED (canonical-won): deploy effects are already visible in selected parent lineage",
             hex::encode(&d.sig[..std::cmp::min(8, d.sig.len())])
         );
     }
@@ -319,6 +322,7 @@ pub async fn prepare_user_deploys(
         }
         return Ok(PreparedUserDeploys {
             deploys: valid_unique,
+            canonical_won_sigs: canonical_won,
             effective_cap: max_user_deploys,
             cap_hit: false,
         });
@@ -397,9 +401,22 @@ pub async fn prepare_user_deploys(
 
     Ok(PreparedUserDeploys {
         deploys: selected,
+        canonical_won_sigs: canonical_won,
         effective_cap: max_user_deploys,
         cap_hit: true,
     })
+}
+
+fn retain_reproposable_self_chain_deploys(
+    deploys: &mut HashSet<Signed<DeployData>>,
+    self_chain_deploy_sigs: &HashSet<Bytes>,
+    canonical_won_sigs: &HashSet<Bytes>,
+) -> usize {
+    let before = deploys.len();
+    deploys.retain(|deploy| {
+        !self_chain_deploy_sigs.contains(&deploy.sig) || !canonical_won_sigs.contains(&deploy.sig)
+    });
+    before.saturating_sub(deploys.len())
 }
 
 fn collect_self_chain_deploy_sigs(
@@ -629,18 +646,14 @@ pub async fn create(
         let self_chain_deploy_sigs =
             collect_self_chain_deploy_sigs(casper_snapshot, validator_identity, block_store)?;
         if !self_chain_deploy_sigs.is_empty() {
-            let before = v.len();
-            // A sig in the proposer's self-chain is normally a duplicate and
-            // must be filtered out. The exception is a sig in
-            // `rejected_in_scope`: the merge engine conflict-rejected it, so
-            // its effects never landed in canonical state and re-proposing
-            // it is correct. Mirror the same exemption that
-            // `prepare_user_deploys` applies upstream.
-            v.retain(|deploy| {
-                !self_chain_deploy_sigs.contains(&deploy.sig)
-                    || casper_snapshot.rejected_in_scope.contains(&deploy.sig)
-            });
-            let skipped = before.saturating_sub(v.len());
+            // A self-chain sig is only terminal if the same canonical-won
+            // record used by `prepare_user_deploys` says its effects are
+            // visible. Side-branch-only inclusions must remain re-proposable.
+            let skipped = retain_reproposable_self_chain_deploys(
+                &mut v,
+                &self_chain_deploy_sigs,
+                &prepared.canonical_won_sigs,
+            );
             if skipped > 0 {
                 tracing::info!(
                     "Filtered {} deploy(s) already present in self latest-message chain",
@@ -683,7 +696,7 @@ pub async fn create(
         v
     };
 
-    // Combine all deploys. prepare_user_deploys already removed deploys in scope.
+    // Combine all deploys. prepare_user_deploys already removed canonical-won deploys.
     let mut all_deploys: HashSet<Signed<DeployData>> = user_deploys;
 
     // Add dummy deploys
@@ -1130,7 +1143,41 @@ mod tests {
             "already-slashed equivocator (not in active_validators) must not be \
              re-slashed even when bond floor > 0 keeps their stake nonzero. If this \
              fires, prepare_slashing_deploys will emit redundant SlashDeploys every \
-             block until the invalid latest message ages out of the DAG view."
+            block until the invalid latest message ages out of the DAG view."
+        );
+    }
+
+    #[test]
+    fn self_chain_filter_keeps_side_branch_only_deploys() {
+        let terminal = construct_deploy::basic_deploy_data(1, None, Some("test".to_string()))
+            .expect("terminal deploy");
+        let side_branch = construct_deploy::basic_deploy_data(2, None, Some("test".to_string()))
+            .expect("side branch deploy");
+
+        let mut deploys = HashSet::new();
+        deploys.insert(terminal.clone());
+        deploys.insert(side_branch.clone());
+
+        let self_chain_deploy_sigs: HashSet<Bytes> =
+            [terminal.sig.clone(), side_branch.sig.clone()]
+                .into_iter()
+                .collect();
+        let canonical_won_sigs: HashSet<Bytes> = [terminal.sig.clone()].into_iter().collect();
+
+        let skipped = retain_reproposable_self_chain_deploys(
+            &mut deploys,
+            &self_chain_deploy_sigs,
+            &canonical_won_sigs,
+        );
+
+        assert_eq!(skipped, 1);
+        assert!(
+            !deploys.contains(&terminal),
+            "canonical-won self-chain deploy must be filtered"
+        );
+        assert!(
+            deploys.contains(&side_branch),
+            "side-branch-only self-chain deploy must remain re-proposable"
         );
     }
 

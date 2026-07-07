@@ -105,18 +105,14 @@ fn compute_rejected_buffer_admits(
     result
 }
 
-/// Sigs whose LATEST canonical disposition across the FULL merge scope is a WIN.
-/// BFS-walks the closure of ALL `parents` (not just the main-parent chain) down to
-/// the deploy-lifespan floor, recording each sig's highest-block disposition: in a
-/// block's `body.deploys` it is a WIN, in `body.rejected_deploys` a REJECTION.
-/// Returns the sigs whose highest-block disposition is a WIN — their effect is in
-/// the merge base the proposing block builds on, so re-proposing them would
-/// double-apply. Walking ALL parents (not only `parents[0]`) catches a deploy
-/// already won on a CO-PARENT of a multi-parent merge, which a main-parent-only
-/// walk misses and re-proposes into a double-apply; a real recovery loser is still
-/// exempt because the merge that rejected it sits at a strictly higher block than
-/// its inclusion. Reads only signed block bodies, so the result is node-identical.
+/// Sigs whose latest main-chain disposition across the selected parents is a WIN.
+///
+/// Walk each parent through its main-parent chain down to the deploy-lifespan
+/// floor. A deploy that only appears in secondary-parent ancestry is not proof
+/// that its effects reached the post-state this block builds on; treating it as
+/// won can strand deploys in finalized side branches forever.
 pub fn canonical_won_sigs(
+    dag: &KeyValueDagRepresentation,
     block_store: &KeyValueBlockStore,
     parents: &[BlockHash],
     earliest_block_number: i64,
@@ -127,28 +123,33 @@ pub fn canonical_won_sigs(
     // REJECTION so a keep-one loser stays re-proposable.
     let mut disposition: HashMap<Bytes, (i64, bool)> = HashMap::new();
     let mut visited: HashSet<BlockHash> = HashSet::new();
-    let mut queue: VecDeque<BlockHash> = parents.iter().cloned().collect();
-    while let Some(hash) = queue.pop_front() {
-        if !visited.insert(hash.clone()) {
-            continue;
-        }
-        let Some(block) = block_store.get(&hash)? else {
-            continue;
-        };
-        let bn = block.body.state.block_number;
-        if bn < earliest_block_number {
-            continue;
-        }
-        for pd in &block.body.deploys {
-            record_disposition(&mut disposition, pd.deploy.sig.clone(), bn, true);
-        }
-        for rd in &block.body.rejected_deploys {
-            record_disposition(&mut disposition, rd.sig.clone(), bn, false);
-        }
-        for p in &block.header.parents_hash_list {
-            queue.push_back(p.clone());
+
+    for parent in parents {
+        let mut current = parent.clone();
+        loop {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            let Some(block) = block_store.get(&current)? else {
+                break;
+            };
+            let bn = block.body.state.block_number;
+            if bn < earliest_block_number {
+                break;
+            }
+            for pd in &block.body.deploys {
+                record_disposition(&mut disposition, pd.deploy.sig.clone(), bn, true);
+            }
+            for rd in &block.body.rejected_deploys {
+                record_disposition(&mut disposition, rd.sig.clone(), bn, false);
+            }
+            let Some(main_parent) = dag.main_parent(&current) else {
+                break;
+            };
+            current = main_parent;
         }
     }
+
     Ok(disposition
         .into_iter()
         .filter_map(|(sig, (_, won))| won.then_some(sig))
@@ -884,13 +885,12 @@ pub async fn compute_parents_post_state(
                 }
             }
 
-            let mut parent_hashes_for_key: Vec<BlockHash> =
+            let parent_hashes_for_key: Vec<BlockHash> =
                 parents.iter().map(|p| p.block_hash.clone()).collect();
-            parent_hashes_for_key.sort();
             let disable_late_block_filtering = disable_late_block_filtering_override
                 .unwrap_or(s.on_chain_state.shard_conf.disable_late_block_filtering);
             let cache_key = super::runtime_manager::ParentsPostStateCacheKey {
-                sorted_parent_hashes: parent_hashes_for_key,
+                parent_hashes: parent_hashes_for_key,
                 snapshot_lfb_hash: s.last_finalized_block.clone(),
                 disable_late_block_filtering,
             };
@@ -900,14 +900,14 @@ pub async fn compute_parents_post_state(
                 tracing::debug!(
                     target: "f1r3fly.casper.compute_parents_post_state.cache",
                     "compute_parents_post_state cache hit: parents={}, rejected_deploys={}, rejected_slashes={}",
-                    cache_key.sorted_parent_hashes.len(),
+                    cache_key.parent_hashes.len(),
                     cached_rejected.len(),
                     cached_slashes.len()
                 );
                 tracing::debug!(
                     target: "f1r3fly.casper.compute_parents_post_state.timing",
                     "compute_parents_post_state timing: path=cache_hit, parents={}, cache_lookup_ms={}, total_ms={}",
-                    cache_key.sorted_parent_hashes.len(),
+                    cache_key.parent_hashes.len(),
                     cache_lookup_started.elapsed().as_millis(),
                     total_started.elapsed().as_millis()
                 );
@@ -1033,18 +1033,21 @@ pub async fn compute_parents_post_state(
             let floor_derive_ms = floor_derive_started.elapsed().as_millis();
             let floor_hash = floor.hash.clone();
 
-            // The floor block's committed post-state is FS(floor) — the merge base.
-            // The floor is an ancestor of the parents (which are stored), so this is
-            // present in normal operation; surface a clear error instead of panicking
-            // if the block store and DAG ever desynchronize.
+            // The floor block bounds the visible merge window. The merge itself
+            // is anchored on the first parent's committed post-state, so secondary
+            // branches can add mergeable effects but cannot erase the state the block
+            // explicitly extends. Surface a clear error instead of panicking if the
+            // block store and DAG ever desynchronize.
             let floor_block = block_store.get(&floor_hash)?.ok_or_else(|| {
                 CasperError::RuntimeError(format!(
                     "finalized-floor block {} not in block store (DAG/store desync)",
                     hex::encode(&floor_hash[..8.min(floor_hash.len())])
                 ))
             })?;
-            let floor_state =
-                Blake2b256Hash::from_bytes_prost(&floor_block.body.state.post_state_hash);
+            let base_parent = &parents[0];
+            let base_hash = base_parent.block_hash.clone();
+            let base_state =
+                Blake2b256Hash::from_bytes_prost(&base_parent.body.state.post_state_hash);
 
             // Scope visible_blocks to blocks at or above the floor: the
             // unfinalized band the merge resolves. Blocks at or below the floor
@@ -1077,16 +1080,18 @@ pub async fn compute_parents_post_state(
                     step = "compute_parents_post_state.FLOOR",
                     floor = %hex::encode(&floor_hash[..8.min(floor_hash.len())]),
                     floor_block = floor_block_number,
-                    base_state = %hex::encode(&floor_block.body.state.post_state_hash[..8.min(floor_block.body.state.post_state_hash.len())]),
+                    floor_state = %hex::encode(&floor_block.body.state.post_state_hash[..8.min(floor_block.body.state.post_state_hash.len())]),
+                    base = %hex::encode(&base_hash[..8.min(base_hash.len())]),
+                    base_state = %hex::encode(&base_parent.body.state.post_state_hash[..8.min(base_parent.body.state.post_state_hash.len())]),
                     scope_before = pre_filter_count,
                     scope_after = visible_blocks.len(),
                     n_dropped = dropped.len(),
                     dropped = ?dropped,
                     n_parents = parents.len(),
-                    "merge.step: floor derived; base=floor.post_state; scope filtered to >= floor block"
+                    "merge.step: floor derived; merge base=main_parent.post_state; scope filtered to >= floor block"
                 );
             }
-            tracing::debug!(target: "f1r3fly.casper.compute_parents_post_state", floor = %hex::encode(&floor_hash[..8.min(floor_hash.len())]), floor_block = floor_block_number, base_state = %hex::encode(&floor_block.body.state.post_state_hash[..8.min(floor_block.body.state.post_state_hash.len())]), scope_blocks = visible_blocks.len(), n_parents = parents.len(), "merge.compute_parents_post_state: floor+base+scope computed");
+            tracing::debug!(target: "f1r3fly.casper.compute_parents_post_state", floor = %hex::encode(&floor_hash[..8.min(floor_hash.len())]), floor_block = floor_block_number, floor_state = %hex::encode(&floor_block.body.state.post_state_hash[..8.min(floor_block.body.state.post_state_hash.len())]), base = %hex::encode(&base_hash[..8.min(base_hash.len())]), base_state = %hex::encode(&base_parent.body.state.post_state_hash[..8.min(base_parent.body.state.post_state_hash.len())]), scope_blocks = visible_blocks.len(), n_parents = parents.len(), "merge.compute_parents_post_state: floor+main-base+scope computed");
             if visible_blocks.len() < pre_filter_count {
                 tracing::debug!(
                     target: "f1r3fly.casper.compute_parents_post_state",
@@ -1201,7 +1206,8 @@ pub async fn compute_parents_post_state(
                 target: "f1r3fly.merge.step",
                 step = "compute_parents_post_state.MERGE_PRE",
                 floor = %hex::encode(&floor_hash[..8.min(floor_hash.len())]),
-                base_state = %hex::encode(&floor_state.bytes()[..8.min(floor_state.bytes().len())]),
+                base = %hex::encode(&base_hash[..8.min(base_hash.len())]),
+                base_state = %hex::encode(&base_state.bytes()[..8.min(base_state.bytes().len())]),
                 scope_blocks = visible_blocks_len,
                 disable_late_block_filtering,
                 "merge.step: dag_merger::merge begin"
@@ -1209,8 +1215,8 @@ pub async fn compute_parents_post_state(
             let merge_started = std::time::Instant::now();
             let merger_result = dag_merger::merge(
                 &s.dag,
-                &floor_hash,
-                &floor_state,
+                &base_hash,
+                &base_state,
                 |hash: &BlockHash| -> Result<Vec<DeployChainIndex>, CasperError> {
                     let block_index = block_index_f(hash)?;
                     Ok(block_index.deploy_chains)

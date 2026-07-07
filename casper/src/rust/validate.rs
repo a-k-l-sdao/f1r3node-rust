@@ -404,6 +404,7 @@ impl Validate {
         // `block_creator` gates on, so proposer and validator never disagree.
         let earliest_block_number = block.body.state.block_number - expiration_threshold as i64;
         let canonical_won = match crate::rust::util::rholang::interpreter_util::canonical_won_sigs(
+            &s.dag,
             block_store,
             &block.header.parents_hash_list,
             earliest_block_number,

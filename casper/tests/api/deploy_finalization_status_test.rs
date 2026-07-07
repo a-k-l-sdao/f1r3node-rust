@@ -124,7 +124,7 @@ async fn resolve_pure_function_returns_pending_for_unknown_sig() {
     assert!(status.latest_block_hash.is_none());
 }
 
-/// Regression test for the resolver's multi-parent DAG coverage.
+/// Regression test for resolver coverage of secondary-parent effects.
 ///
 /// Builds a minimal multi-parent DAG:
 ///
@@ -138,16 +138,12 @@ async fn resolve_pure_function_returns_pending_for_unknown_sig() {
 /// ```
 ///
 /// The deploy sig under test lives only in `B.body.deploys`. B reaches
-/// canonical state via C's secondary-parent slot, not via the main-parent
-/// chain from C.
+/// canonical state through C's secondary-parent slot, not through C's
+/// main-parent chain.
 ///
-/// A main-parent-only walk (`dag.main_parent_chain(C, _)`) visits
-/// `C → A → genesis` and never touches B, so it misses the sig and the
-/// resolver reports `Pending`. A BFS over all parents visits B through C's
-/// secondary slot, finds the sig in `body.deploys`, and reports `Finalized`.
-///
-/// This test exists to keep the BFS semantics (over `parents_hash_list`, not
-/// just `main_parent`) locked in.
+/// A main-parent-only walk would miss B and report `Pending`. The resolver must
+/// treat the all-parent DAG ancestry of LFB as effect-visible and report the
+/// deploy as `Finalized`.
 #[tokio::test]
 async fn resolve_finds_sig_in_secondary_parent_branch() {
     use block_storage::rust::key_value_block_store::KeyValueBlockStore;
@@ -277,7 +273,7 @@ async fn resolve_finds_sig_in_secondary_parent_branch() {
 /// **production-shape multi-parent DAG**.
 ///
 /// `resolve_batch` lifts the per-sig BFS state into a struct so a single
-/// canonical-chain walk can update many sigs at once (one BFS per merge
+/// finalized-DAG walk can update many sigs at once (one BFS per merge
 /// step instead of one per rejected deploy).
 /// Both entry points share `run_prelude`, `bfs_finalized_window`, and
 /// `finalize_sig_state`; this test ensures the *external* contract
@@ -288,7 +284,7 @@ async fn resolve_finds_sig_in_secondary_parent_branch() {
 /// entire reason `bfs_finalized_window` walks `parents_hash_list`
 /// instead of just main-parents. The production f1r3fly shard
 /// produces multi-parent merges constantly, and the resolver's
-/// canonical-descendant invalidation rule has different outcomes in
+/// effect-visible invalidation rule has different outcomes in
 /// multi-parent vs. single-chain topology.
 ///
 /// DAG shape:
@@ -323,23 +319,16 @@ async fn resolve_finds_sig_in_secondary_parent_branch() {
 /// | `clean_via_secondary`              | only in S.body.deploys (secondary-parent)    | `Finalized`    |
 /// | `failed_canonical`                 | A.body.deploys with `is_failed=true`         | `Failed`       |
 /// | `clean_canonical_reject_canonical` | clean in A, rejected in B (canonical desc.)  | `Pending`      |
-/// | `clean_canonical_reject_sibling`   | clean in A, rejected in S (non-canonical)    | `Finalized`    |
+/// | `clean_canonical_reject_sibling`   | clean in A, rejected in S (secondary-visible)| `Pending`      |
 /// | `unknown`                          | not in DAG                                   | `Pending` (unknown) |
 ///
-/// **Regression guard for canonical-descendant invalidation.**
+/// **Regression guard for effect-visible invalidation.**
 /// `clean_canonical_reject_sibling` is the case that distinguishes the
-/// resolver's *intended* semantics ("rejection invalidates clean only
-/// when the rejection is on the canonical chain") from a buggier
-/// reading ("rejection invalidates clean when the rejection's main
-/// parent walk lands on the clean block"). Under the latter,
-/// `is_in_main_chain(A, S) = true` would invalidate clean inclusion at
-/// A even though S itself is a non-canonical sibling whose effects are
-/// not in canonical post-state. The correct resolver behavior is to
-/// require both:
-///   1. clean is in reject's main-parent ancestry, AND
-///   2. reject is itself on the LFB's main-parent chain.
-///
-/// This test exercises that distinction.
+/// resolver's effect-visible semantics from the old main-parent-only gate.
+/// Because C includes S through a secondary-parent slot, S's rejection metadata
+/// is visible from the LFB DAG view and must invalidate the earlier clean
+/// inclusion at A. Without this, the rejected-deploy buffer can treat a dropped
+/// deploy as terminal and strand funds/effects that should be re-proposed.
 #[tokio::test]
 async fn resolve_and_resolve_batch_agree_across_states() {
     use std::collections::HashSet;
@@ -452,8 +441,7 @@ async fn resolve_and_resolve_batch_agree_across_states() {
 
     // Block B: canonical h=2, main-parent A. Carries the canonical
     // rejection of `clean_canonical_reject_canonical`. B is the main
-    // parent of LFB so `is_in_main_chain(B, C)` is true → B is
-    // canonical, and its rejection should invalidate the clean
+    // parent of LFB, and its rejection should invalidate the clean
     // inclusion at A.
     //
     // `get_random_block` has no rejected-deploys parameter, so we
@@ -478,9 +466,8 @@ async fn resolve_and_resolve_batch_agree_across_states() {
         sig: sig_clean_canonical_reject_canonical.clone(),
     }];
 
-    // Block S: non-canonical sibling of B at h=2. Has main parent A
-    // (so `is_in_main_chain(A, S)` is true) but is NOT on LFB's
-    // main-parent chain (`is_in_main_chain(S, C)` is false).
+    // Block S: sibling of B at h=2. It is not on LFB's main-parent chain,
+    // but it is effect-visible because C includes it as a secondary parent.
     //
     // Body:
     //   - body.deploys = [clean_via_secondary]
@@ -488,12 +475,10 @@ async fn resolve_and_resolve_batch_agree_across_states() {
     //     secondary-parent slots. With no rejection of this sig
     //     anywhere, the resolver should return Finalized.
     //   - body.rejected_deploys = [clean_canonical_reject_sibling]
-    //     Exercises the canonical-descendant invalidation rule:
-    //     `is_in_main_chain(A, S) = true` alone is not sufficient
-    //     to invalidate the clean inclusion at A, because S itself
-    //     is non-canonical. The rejection block must also be on
-    //     LFB's main-parent chain — which S is not — so this
-    //     rejection is ignored and the sig stays Finalized.
+    //     Exercises effect-visible invalidation: S is not on C's
+    //     main-parent chain, but C's secondary-parent edge makes S's
+    //     rejection visible, so it invalidates the earlier clean
+    //     inclusion at A.
     let mut block_s = block_implicits::get_random_block(
         Some(2),
         Some(2), // distinct seq number from B to give a different block hash
@@ -515,8 +500,8 @@ async fn resolve_and_resolve_batch_agree_across_states() {
     }];
 
     // Block C: LFB. Multi-parent merge of [B, S]. Main parent = B,
-    // secondary parent = S. BFS from C visits both B (canonical) and
-    // S (non-canonical) via the parents_hash_list slots.
+    // secondary parent = S. BFS from C visits both B and S via the
+    // parents_hash_list slots.
     let block_c = block_implicits::get_random_block(
         Some(3),
         Some(1),
@@ -573,7 +558,7 @@ async fn resolve_and_resolve_batch_agree_across_states() {
     assert_eq!(
         single_clean_via_secondary.state,
         DeployFinalizationState::Finalized,
-        "clean_via_secondary sig must be Finalized — BFS must reach S via C's secondary-parent slot"
+        "clean_via_secondary sig must be Finalized because S is effect-visible through C's secondary-parent slot"
     );
     assert_eq!(
         single_failed.state,
@@ -591,13 +576,12 @@ async fn resolve_and_resolve_batch_agree_across_states() {
     );
     assert_eq!(
         single_clean_canonical_reject_sibling.state,
-        DeployFinalizationState::Finalized,
-        "clean_canonical_reject_sibling must be Finalized — rejection at S is on a non-canonical sibling chain (S is not on LFB's main-parent chain) and must NOT invalidate the clean inclusion at A. \
-         If this assertion fails with state=Pending, the resolver's canonical-descendant check is over-aggressive: it accepts any reject_block whose main-parent walk passes through clean_block, without verifying reject_block itself is canonical."
+        DeployFinalizationState::Pending,
+        "clean_canonical_reject_sibling must be Pending because S is effect-visible through C's secondary-parent slot and rejects the earlier clean inclusion at A"
     );
     assert_eq!(
         single_clean_canonical_reject_sibling.rejection_count, 1,
-        "clean_canonical_reject_sibling must have rejection_count=1 (the rejection is observed and counted; only the *invalidation* of the clean inclusion is rejected)"
+        "clean_canonical_reject_sibling must have rejection_count=1"
     );
     assert_eq!(
         single_unknown.state,
@@ -798,10 +782,9 @@ async fn resolve_returns_pending_for_unfinalized_inclusion_past_lifespan() {
     );
 }
 
-/// `Failed` and `Finalized` decisions both apply the canonical-descendant
-/// gate in a multi-parent DAG. A failed inclusion in a non-main-chain
-/// finalized sibling (visited via a secondary parent in the BFS) does not
-/// terminate the state machine — the latest canonical inclusion wins.
+/// `Failed` and `Finalized` decisions both apply the effect-visible
+/// rejection gate in a multi-parent DAG. A failed inclusion in a secondary
+/// branch can be observed, but a later clean inclusion still wins.
 ///
 /// DAG shape:
 ///
@@ -818,11 +801,11 @@ async fn resolve_returns_pending_for_unfinalized_inclusion_past_lifespan() {
 /// ```
 ///
 /// Sig X appears in:
-///   - S.body.deploys with `is_failed=true` (non-canonical sibling)
+///   - S.body.deploys with `is_failed=true` (secondary-visible sibling)
 ///   - D.body.deploys with `is_failed=false` (canonical, higher height)
 ///
-/// The failed event in S is gated out (S is not on LFB's main-parent
-/// chain); the latest canonical inclusion is D's clean event → `Finalized`.
+/// The failed event in S is lower than D's clean event, so the latest
+/// effect-visible inclusion is D's clean event -> `Finalized`.
 #[tokio::test]
 async fn resolve_returns_finalized_for_clean_canonical_after_failed_secondary() {
     use block_storage::rust::key_value_block_store::KeyValueBlockStore;
@@ -993,7 +976,7 @@ async fn resolve_returns_finalized_for_clean_canonical_after_failed_secondary() 
         status.state,
         DeployFinalizationState::Finalized,
         "clean canonical inclusion at D must win over failed event in \
-         non-canonical sibling S; got {:?}",
+         secondary-visible sibling S; got {:?}",
         status.state,
     );
     assert_eq!(
@@ -1004,8 +987,8 @@ async fn resolve_returns_finalized_for_clean_canonical_after_failed_secondary() 
     );
 }
 
-/// Same-chain symmetric gate: a deploy that fails canonically at A, gets
-/// canonical-descendant-rejected at B, and is re-tried clean canonically
+/// Same-chain symmetric gate: a deploy that fails at A, gets
+/// descendant-rejected at B, and is re-tried clean
 /// at C must resolve to `Finalized`. The latest canonical inclusion (C
 /// clean at h=3) wins over the earlier failed inclusion at A. Without
 /// this, `repeat_deploy` would exempt the sig as a recovery candidate
@@ -1019,7 +1002,7 @@ async fn resolve_returns_finalized_for_clean_canonical_after_failed_secondary() 
 ///       A (h=1)            canonical; sig X with is_failed=true
 ///       |
 ///       B (h=2)            canonical; sig X in body.rejected_deploys
-///       |                  (canonical-descendant rejection of A's failed
+///       |                  (descendant rejection of A's failed
 ///       |                   inclusion — recovery flow's first step)
 ///       C (h=3, LFB)       canonical; sig X clean (recovery succeeded)
 /// ```
@@ -1158,7 +1141,7 @@ async fn resolve_returns_finalized_when_canonical_clean_supersedes_canonical_fai
         Some(&block_c.block_hash),
         "latest_block_hash must point at C (the canonical clean inclusion)",
     );
-    // Rejection count should reflect B's canonical-descendant rejection event.
+    // Rejection count should reflect B's descendant rejection event.
     assert_eq!(
         status.rejection_count, 1,
         "exactly one canonical-chain rejection event (in block B)",
@@ -1358,13 +1341,12 @@ async fn resolve_with_known_block_uses_fallback_block_when_deploy_index_misses()
     assert_eq!(with_known_block.rejection_count, 0);
 }
 
-/// Symmetric clean-side canonical-descendant gate.
+/// Symmetric clean-side effect-visible rejection gate.
 ///
-/// A clean inclusion in a non-main-chain finalized sibling whose effects
-/// are rejected at the canonical merge step must not resolve to
-/// `Finalized`. The non-canonical clean event has to be invalidated by
-/// the canonical rejection the same way `is_in_main_chain` invalidates a
-/// canonical clean event when a canonical-descendant rejection exists.
+/// A clean inclusion in a secondary-visible sibling whose effects are rejected
+/// at the merge step must not resolve to `Finalized`. The clean event has to be
+/// invalidated by the visible rejection even though the clean block is not on the
+/// LFB main-parent chain.
 ///
 /// DAG shape:
 ///
@@ -1373,23 +1355,21 @@ async fn resolve_with_known_block_uses_fallback_block_when_deploy_index_misses()
 ///       |
 ///       A (h=1)               canonical
 ///      / \
-///     B   Y (both h=2)        B canonical, Y non-canonical sibling
-///      \ /                    (main_parent=A but not on LFB main chain)
+///     B   Y (both h=2)        B main-parent side, Y secondary side
+///      \ /
 ///       C (h=3, LFB)          merge of [B, Y]; main parent = B.
 ///                             Body.rejected_deploys = [sig_X].
 /// ```
 ///
 /// Sig X appears in Y.body.deploys (clean) and C.body.rejected_deploys
 /// (canonical merge rejection). Without the symmetric gate the resolver
-/// returns `Finalized` because `is_in_main_chain(Y, C) = false` keeps
-/// the existing canonical-descendant rule from firing — but Y is itself
-/// non-canonical, and C's rejection records that the merge dropped the
-/// effects when integrating Y. Sig X is not in canonical state.
+/// returns `Finalized` because a main-parent-only rule misses Y -> C.
+/// C's rejection records that the merge dropped Y's effects, so sig X is
+/// not in canonical state.
 ///
 /// `repeat_deploy` would treat the (incorrect) `Finalized` as kept-in-check
-/// but the ancestor scan over canonical main-parent chain would not find
-/// the sig (it lives only in non-canonical Y), letting a re-proposal
-/// validate and re-execute → double-execution.
+/// but a main-parent-only ancestor scan would not find the sig (it lives only
+/// in Y), letting a re-proposal validate and re-execute -> double-execution.
 #[tokio::test]
 async fn resolve_returns_pending_for_non_canonical_clean_with_canonical_reject() {
     use block_storage::rust::key_value_block_store::KeyValueBlockStore;
@@ -1467,7 +1447,7 @@ async fn resolve_returns_pending_for_non_canonical_clean_with_canonical_reject()
         None,
     );
 
-    // Y: h=2, non-canonical sibling of B. Carries sig_X clean.
+    // Y: h=2, secondary-side sibling of B. Carries sig_X clean.
     let block_y = block_implicits::get_random_block(
         Some(2),
         Some(2),
@@ -1536,7 +1516,7 @@ async fn resolve_returns_pending_for_non_canonical_clean_with_canonical_reject()
     assert_eq!(
         status.state,
         DeployFinalizationState::Pending,
-        "non-canonical clean inclusion + canonical rejection must NOT resolve \
+        "secondary clean inclusion + visible rejection must NOT resolve \
          to Finalized; got {:?}",
         status.state,
     );

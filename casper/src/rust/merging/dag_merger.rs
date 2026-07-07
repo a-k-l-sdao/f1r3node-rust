@@ -479,25 +479,22 @@ pub fn merge(
             disable_late_block_filtering = disable_late_block_filtering);
     }
 
-    // Blocks to merge are all blocks in scope that are NOT the LFB or its ancestors.
-    // This includes:
-    // 1. Descendants of LFB (blocks built on top of LFB)
-    // 2. Siblings of LFB (blocks at same height but different branch) that are ancestors of the tips
-    // Previously we only included descendants, which missed deploy effects from sibling branches.
+    // Blocks to merge are all scoped blocks whose effects are not already
+    // included in the chosen base block's post-state. A block post-state
+    // includes its full DAG ancestry, not only its main-parent chain, so scoped
+    // merges must exclude the base block and all DAG ancestors of that base.
     let actual_blocks: HashSet<BlockHash> = match &scope {
         Some(scope_blocks) => {
-            // Avoid unbounded full-DAG ancestor scans. Check each scope block against LFB directly.
             let mut result = HashSet::new();
             for candidate in scope_blocks {
-                if !dag.is_in_main_chain(candidate, lfb)? {
+                let already_in_base = candidate == lfb || dag.is_dag_ancestor(candidate, lfb)?;
+                if !already_in_base {
                     result.insert(candidate.clone());
                 }
             }
             if tracing::enabled!(target: "f1r3fly.merge.step", tracing::Level::DEBUG) {
                 let included: Vec<String> = result.iter().map(|b| hex::encode(&b[..])).collect();
-                // Scope blocks excluded from the merge set because they ARE in the
-                // LFB main chain (i.e. the LFB or its ancestors).
-                let excluded_in_main: Vec<String> = scope_blocks
+                let excluded_in_base: Vec<String> = scope_blocks
                     .iter()
                     .filter(|b| !result.contains(*b))
                     .map(|b| hex::encode(&b[..]))
@@ -505,9 +502,9 @@ pub fn merge(
                 tracing::debug!(target: "f1r3fly.merge.step", step = "merge.actual_blocks.SCOPED",
                     n_scope = scope_blocks.len(),
                     n_included = result.len(),
-                    n_excluded_in_main_chain = scope_blocks.len() - result.len(),
+                    n_excluded_in_base = scope_blocks.len() - result.len(),
                     included = ?included,
-                    excluded_in_main_chain = ?excluded_in_main);
+                    excluded_in_base = ?excluded_in_base);
             }
             result
         }
@@ -540,7 +537,7 @@ pub fn merge(
 
     // Log the block sets for debugging
     tracing::info!(
-        "DagMerger.merge: LFB={}, scope={}, actualBlocks (above LFB)={}, lateBlocks={}",
+        "DagMerger.merge: LFB={}, scope={}, actualBlocks (outside base DAG ancestry)={}, lateBlocks={}",
         hex::encode(&lfb[..std::cmp::min(8, lfb.len())]),
         scope
             .as_ref()

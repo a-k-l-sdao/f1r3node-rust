@@ -140,10 +140,15 @@ impl ReplayRuntimeOps {
         // Time user deploys phase
         tracing::debug!(target: "f1r3fly.casper.replay_rho_runtime", n_user = terms.len(), "replay.replay_deploys: USER-deploy phase");
         let user_deploys_start = Instant::now();
+        let mut post_state_root = Blake2b256Hash::from_bytes_prost(start_hash);
+        let checkpoint_after_each_deploy = with_cost_accounting;
         let mut deploy_results = Vec::new();
         for term in terms {
             let result = self.replay_deploy_e(with_cost_accounting, &term).await?;
             deploy_results.push(result);
+            if checkpoint_after_each_deploy {
+                post_state_root = self.create_replay_checkpoint().await;
+            }
         }
         metrics::histogram!(BLOCK_REPLAY_PHASE_USER_DEPLOYS_TIME_METRIC, "source" => CASPER_METRICS_SOURCE)
             .record(user_deploys_start.elapsed().as_secs_f64());
@@ -157,6 +162,12 @@ impl ReplayRuntimeOps {
                 .replay_block_system_deploy(block_data, &system_deploy)
                 .await?;
             system_deploy_results.push(result);
+            if checkpoint_after_each_deploy {
+                post_state_root = self.create_replay_checkpoint().await;
+            }
+        }
+        if !checkpoint_after_each_deploy {
+            post_state_root = self.create_replay_checkpoint().await;
         }
         metrics::histogram!(BLOCK_REPLAY_PHASE_SYSTEM_DEPLOYS_TIME_METRIC, "source" => CASPER_METRICS_SOURCE)
             .record(system_deploys_start.elapsed().as_secs_f64());
@@ -165,16 +176,18 @@ impl ReplayRuntimeOps {
         all_mergeable.extend(deploy_results);
         all_mergeable.extend(system_deploy_results);
 
-        // Time create-checkpoint phase - Span[F].traceI("create-checkpoint") from Scala
+        tracing::debug!(target: "f1r3fly.casper.replay_rho_runtime", computed_root = %hex::encode(&post_state_root.bytes()[..8.min(post_state_root.bytes().len())]), "replay.replay_deploys DONE (computed final replay root)");
+        Ok((post_state_root, all_mergeable))
+    }
+
+    async fn create_replay_checkpoint(&mut self) -> Blake2b256Hash {
         let checkpoint_start = Instant::now();
         tracing::debug!(target: "f1r3fly.casper.replay_rho_runtime", "create-checkpoint-started");
         let checkpoint = self.runtime_ops.runtime.create_checkpoint().await;
         tracing::debug!(target: "f1r3fly.casper.replay_rho_runtime", "create-checkpoint-finished");
         metrics::histogram!(BLOCK_REPLAY_PHASE_CREATE_CHECKPOINT_TIME_METRIC, "source" => CASPER_METRICS_SOURCE)
             .record(checkpoint_start.elapsed().as_secs_f64());
-
-        tracing::debug!(target: "f1r3fly.casper.replay_rho_runtime", computed_root = %hex::encode(&checkpoint.root.bytes()[..8.min(checkpoint.root.bytes().len())]), "replay.replay_deploys DONE (computed final replay root)");
-        Ok((checkpoint.root, all_mergeable))
+        checkpoint.root
     }
 
     /**

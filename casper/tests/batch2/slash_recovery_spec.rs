@@ -318,14 +318,13 @@ async fn e1c_re_issues_merge_rejected_slash() {
         "test setup requires multi-parent proposer view; got {} parent(s)",
         snapshot.parents.len()
     );
-    let mut sorted_parent_hashes: Vec<prost::bytes::Bytes> = snapshot
+    let parent_hashes: Vec<prost::bytes::Bytes> = snapshot
         .parents
         .iter()
         .map(|p| p.block_hash.clone())
         .collect();
-    sorted_parent_hashes.sort();
     let cache_key = ParentsPostStateCacheKey {
-        sorted_parent_hashes,
+        parent_hashes,
         snapshot_lfb_hash: snapshot.last_finalized_block.clone(),
         disable_late_block_filtering: snapshot
             .on_chain_state
@@ -494,14 +493,13 @@ async fn rejected_slash_recovery_keeps_empty_proposer_alive() {
         "test setup requires multi-parent proposer view; got {} parent(s)",
         snapshot.parents.len()
     );
-    let mut sorted_parent_hashes: Vec<prost::bytes::Bytes> = snapshot
+    let parent_hashes: Vec<prost::bytes::Bytes> = snapshot
         .parents
         .iter()
         .map(|p| p.block_hash.clone())
         .collect();
-    sorted_parent_hashes.sort();
     let cache_key = ParentsPostStateCacheKey {
-        sorted_parent_hashes,
+        parent_hashes,
         snapshot_lfb_hash: snapshot.last_finalized_block.clone(),
         disable_late_block_filtering: snapshot
             .on_chain_state

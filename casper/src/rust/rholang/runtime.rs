@@ -293,31 +293,17 @@ impl RuntimeOps {
         }
 
         let mut res = Vec::with_capacity(terms.len());
+        let mut post_state_hash = start_hash.clone();
         for deploy in terms {
             res.push(self.play_deploy_with_cost_accounting(deploy).await?);
+            let checkpoint = self.runtime.create_checkpoint().await;
+            post_state_hash = checkpoint.root.to_bytes_prost();
         }
 
         if let Some(rss_kb) = crate::rust::util::rholang::mem_profiler::read_vm_rss_kb() {
-            tracing::debug!(target: "f1r3fly.casper.mem_profile", step = "before_final_checkpoint", rss_kb);
+            tracing::debug!(target: "f1r3fly.casper.mem_profile", step = "after_per_deploy_checkpoints", rss_kb);
         }
-        if let Some(rss_kb) = crate::rust::util::rholang::mem_profiler::read_vm_rss_kb() {
-            tracing::debug!(target: "f1r3fly.casper.mem_profile", step = "before_final_checkpoint_create_checkpoint", rss_kb);
-        }
-        let final_checkpoint = self.runtime.create_checkpoint().await;
-        if let Some(rss_kb) = crate::rust::util::rholang::mem_profiler::read_vm_rss_kb() {
-            tracing::debug!(target: "f1r3fly.casper.mem_profile", step = "after_final_checkpoint_create_checkpoint", rss_kb);
-        }
-        if let Some(rss_kb) = crate::rust::util::rholang::mem_profiler::read_vm_rss_kb() {
-            tracing::debug!(target: "f1r3fly.casper.mem_profile", step = "before_final_checkpoint_root_to_bytes", rss_kb);
-        }
-        let final_root = final_checkpoint.root.to_bytes_prost();
-        if let Some(rss_kb) = crate::rust::util::rholang::mem_profiler::read_vm_rss_kb() {
-            tracing::debug!(target: "f1r3fly.casper.mem_profile", step = "after_final_checkpoint_root_to_bytes", rss_kb);
-        }
-        if let Some(rss_kb) = crate::rust::util::rholang::mem_profiler::read_vm_rss_kb() {
-            tracing::debug!(target: "f1r3fly.casper.mem_profile", step = "after_final_checkpoint", rss_kb);
-        }
-        Ok((final_root, res))
+        Ok((post_state_hash, res))
     }
 
     /**

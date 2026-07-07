@@ -98,14 +98,12 @@ struct ResolverState {
     rejection_count: u32,
     /// Highest-block-number `is_failed=true` inclusion + its block hash.
     /// Tracked symmetrically with `clean_finalized_event` so the
-    /// post-loop step can apply the same canonical-descendant gate to
-    /// both — a failed inclusion in a non-main-chain finalized sibling
-    /// must NOT terminate the state machine when a later canonical
-    /// clean inclusion exists.
+    /// post-loop step can apply the same effect-visible rejection gate
+    /// to both failed and clean inclusions.
     failed_finalized_event: Option<(i64, BlockHash)>,
     /// Highest-block-number clean inclusion + its block hash. Tracked
-    /// together so the post-loop invalidation step can do a canonical-
-    /// descendant ancestry comparison against `latest_rejected_event`.
+    /// together so the post-loop invalidation step can compare DAG ancestry
+    /// against `latest_rejected_event`.
     clean_finalized_event: Option<(i64, BlockHash)>,
     latest_event: Option<(i64, BlockHash)>,
     latest_rejected_event: Option<(i64, BlockHash)>,
@@ -382,11 +380,11 @@ fn bfs_finalized_window(
     Ok(())
 }
 
-/// Apply the per-sig post-loop rules: canonical-descendant invalidation
-/// of clean inclusions, latest_block_hash fallback to the first-seen
-/// block, expiry rule, and final state determination.
+/// Apply the per-sig post-loop rules: effect-visible rejection invalidation,
+/// latest_block_hash fallback to the first-seen block, expiry rule, and final
+/// state determination.
 ///
-/// Returns `ApiErr` rather than swallowing failures from `is_in_main_chain`.
+/// Returns `ApiErr` rather than swallowing failures from DAG ancestry checks.
 /// The resolver's `state` field is consensus-relevant — `repeat_deploy`
 /// validation reads it via the `rejected_in_scope` exemption — so two
 /// validators must not silently disagree on it under transient I/O.
@@ -395,98 +393,50 @@ fn finalize_sig_state(
     deploy_lifespan: i64,
     state: ResolverState,
 ) -> ApiErr<DeployFinalizationStatus> {
-    // A rejection invalidates a clean inclusion only when the
-    // rejection block is a CANONICAL-CHAIN DESCENDANT of the clean
-    // block. Two reasons height alone is wrong:
+    // A finalized event is effect-visible when the all-parent BFS from
+    // the LFB saw it. In a multi-parent merge, deploy effects can reach
+    // canonical state through a secondary-parent branch even when the
+    // source block is not on the LFB main-parent chain.
     //
-    //  1. Multi-parent DAGs: blocks at the same height can be siblings
-    //     on separate chains. A rejection in a sibling at the same or
-    //     higher height does not affect the deploy's effects in a
-    //     canonical block on a different chain.
-    //  2. Recovery cycles via the rejected-deploy buffer produce
-    //     rejection events in non-canonical sibling blocks (validators
-    //     racing to recover the same deploy). Counting these as "after"
-    //     the clean inclusion creates a positive feedback loop where
-    //     the deploy stays Pending while the buffer keeps re-proposing.
-    //
-    // Two conditions must BOTH hold for a rejection to invalidate a
-    // clean inclusion:
-    //
-    //   (a) `is_in_main_chain(clean_block, reject_block)` — clean is
-    //       in reject's main-parent ancestry. Necessary so the
-    //       rejection is "downstream" of the clean inclusion.
-    //   (b) `is_in_main_chain(reject_block, lfb)` — reject is itself
-    //       on LFB's main-parent chain (i.e., canonical). Necessary
-    //       because (a) alone is satisfied even by non-canonical
-    //       sibling blocks: a sibling fork B' that has the canonical
-    //       clean block A as its main parent will pass (a) yet sit
-    //       outside LFB's main chain. Without (b) the resolver
-    //       reports false-Pending for sigs that are genuinely in
-    //       canonical state — exactly the recovery-cycle case the
-    //       comment above warns about.
-    //
-    // Same-block (clean and rejection in the SAME block — e.g., a
-    // recovery proposal whose merge step also dedup-rejected an older
-    // copy in scope) is not a "descendant" and must not invalidate.
-    // Same gate, applied symmetrically to clean and failed inclusions.
-    //
-    // Failed events: drop the event if either (a) the failed block is
-    // not on LFB's main-parent chain (visited via secondary parent in
-    // BFS — finalized but not canonical), or (b) a canonical-descendant
-    // rejection nullifies the failed inclusion the same way it nullifies
-    // a clean one. Without this, a stale `is_failed=true` event in a
-    // non-canonical sibling pins the resolver at `Failed` and preempts
-    // a later canonical clean inclusion — `repeat_deploy` then exempts
-    // the sig as a recovery candidate, allowing double-execution of a
-    // canonically clean deploy.
+    // Rejections are different: they are merge metadata saying a deploy
+    // from an ancestor branch was dropped while computing the visible
+    // state. A later effect-visible rejection invalidates a clean or
+    // failed inclusion only when the rejected event is causally
+    // downstream of the inclusion in DAG ancestry. Same-block clean and
+    // rejection is not a descendant and must not invalidate.
     let lfb_hash = dag.last_finalized_block();
 
-    let canonical_block = |block: &BlockHash| -> ApiErr<bool> {
-        Ok(block == &lfb_hash || dag.is_in_main_chain(block, &lfb_hash)?)
+    let effect_visible_block = |block: &BlockHash| -> ApiErr<bool> {
+        Ok(block == &lfb_hash || dag.is_dag_ancestor(block, &lfb_hash)?)
     };
 
-    // Resolve clean event with two invalidation rules:
-    //
-    //   (i) Non-canonical clean + canonical reject: the merge that
-    //       integrated the non-canonical chain rejected this deploy, so
-    //       its effects are not in canonical state.
-    //   (ii) Canonical clean + canonical-descendant reject: the existing
-    //        `is_in_main_chain` rule — a rejection downstream of a
-    //        canonical clean inclusion invalidates that inclusion.
-    //
-    // Without (i), a non-canonical clean event survives whenever the
-    // rejection isn't a main-parent ancestor — which is true by
-    // construction of any non-canonical clean — letting the resolver
-    // report `Finalized` for a sig whose effects are not in canonical
-    // state.
-    let mut clean_canonical: Option<(i64, BlockHash)> = state.clean_finalized_event.clone();
-    if let (Some((_, clean_block)), Some((_, reject_block))) =
-        (&state.clean_finalized_event, &state.latest_rejected_event)
-    {
-        let reject_is_canonical = canonical_block(reject_block)?;
-        let clean_is_canonical = canonical_block(clean_block)?;
-        if !clean_is_canonical && reject_is_canonical {
-            clean_canonical = None;
-        } else if reject_is_canonical
-            && clean_block != reject_block
-            && dag.is_in_main_chain(clean_block, reject_block)?
-        {
-            clean_canonical = None;
+    let mut clean_canonical: Option<(i64, BlockHash)> = None;
+    if let Some((clean_height, clean_block)) = &state.clean_finalized_event {
+        if effect_visible_block(clean_block)? {
+            let mut keep = true;
+            if let Some((_, reject_block)) = &state.latest_rejected_event {
+                let reject_is_visible = effect_visible_block(reject_block)?;
+                let reject_is_downstream = clean_block != reject_block
+                    && dag.is_dag_ancestor(clean_block, reject_block)?;
+                if reject_is_visible && reject_is_downstream {
+                    keep = false;
+                }
+            }
+            if keep {
+                clean_canonical = Some((*clean_height, clean_block.clone()));
+            }
         }
     }
 
-    // Resolve failed event with the symmetric gate: it must be on the
-    // main chain, AND not invalidated by a canonical-descendant rejection.
     let mut failed_canonical: Option<(i64, BlockHash)> = None;
     if let Some((failed_height, failed_block)) = &state.failed_finalized_event {
-        if canonical_block(failed_block)? {
+        if effect_visible_block(failed_block)? {
             let mut keep = true;
             if let Some((_, reject_block)) = &state.latest_rejected_event {
-                let reject_is_canonical = canonical_block(reject_block)?;
-                let reject_is_canonical_descendant = failed_block != reject_block
-                    && reject_is_canonical
-                    && dag.is_in_main_chain(failed_block, reject_block)?;
-                if reject_is_canonical_descendant {
+                let reject_is_visible = effect_visible_block(reject_block)?;
+                let reject_is_downstream = failed_block != reject_block
+                    && dag.is_dag_ancestor(failed_block, reject_block)?;
+                if reject_is_visible && reject_is_downstream {
                     keep = false;
                 }
             }
@@ -579,15 +529,15 @@ fn finalize_sig_state(
 /// (unknown sig, first-seen body missing from the store) returns
 /// `pending_unknown` directly.
 ///
-/// The state machine is a canonical-chain scan:
+/// The state machine is a finalized DAG scan:
 ///
 /// 1. Look up the sig in the deploy index. Unknown sig → `Pending`.
 /// 2. Fetch the first-seen block to read `valid_after_block_number`.
-/// 3. Walk the finalized chain from LFB backward for `deploy_lifespan`
+/// 3. Walk finalized DAG ancestry from LFB backward for `deploy_lifespan`
 ///    blocks, tallying clean inclusions, failed inclusions, rejections,
 ///    and `latest_block_hash`.
 /// 4. Apply the state rules: failed finalized → `Failed`; clean finalized
-///    without a later canonical-descendant rejection → `Finalized`;
+///    without a later effect-visible rejection → `Finalized`;
 ///    beyond lifespan without a clean inclusion → `Expired`; otherwise
 ///    → `Pending`.
 pub fn resolve(
@@ -637,7 +587,7 @@ pub fn resolve_with_known_block(
     resolve_from_state(dag, block_store, deploy_lifespan, state)
 }
 
-/// Batched resolver for many sigs in a single canonical-chain scan.
+/// Batched resolver for many sigs in a single finalized-DAG scan.
 /// Optimizes the catchup-heavy hot path in
 /// `compute_parents_post_state::should_admit_to_rejected_buffer`, where
 /// every rejected deploy in a merge would otherwise trigger an
